@@ -1,0 +1,6 @@
+github.com/pixiv/go-libjpeg v0.0.0-20190822045933-3da21a74767d h1:ls+7AYarUlUSetfnN/DKVNcK6W8mQWc6VblmOm4XwX0=
+github.com/pixiv/go-libjpeg v0.0.0-20190822045933-3da21a74767d/go.mod h1:DO7ixpslN6XfbWzeNH9vkS5CF2FQUX81B85rYe9zDxU=
+github.com/vladimirvivien/go4vl v0.2.0 h1:BwBegMH8n9Tha11MKfCj8r+HgKJX/3WM/J+tUm22/hY=
+github.com/vladimirvivien/go4vl v0.2.0/go.mod h1:xwWmrQ30jIM6LfpwWVRalvZirx9e94oVgD5tsCKrV1s=
+golang.org/x/sys v0.37.0 h1:fdNQudmxPjkdUTPnLn5mdQv7Zwvbvpaxqs831goi9kQ=
+golang.org/x/sys v0.37.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=
