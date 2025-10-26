@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"image"
 	stdjpeg "image/jpeg"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -79,41 +78,41 @@ func (fb *FrameBuffer) GetFull() []byte {
 	return frame
 }
 
-var cam *device.Device
+var (
+	cam         *device.Device
+	stdoutMutex sync.Mutex
+)
 
 func main() {
 	flag.Parse()
 
-	// Ensure all log output goes to stderr (data output goes to stdout)
-	log.SetOutput(os.Stderr)
-
-	log.Printf("Starting v4l2 MJPEG streamer with libjpeg-turbo DCT scaling...")
+	logJSON("info", "Starting v4l2 MJPEG streamer with libjpeg-turbo DCT scaling")
 
 	frameBuffer := &FrameBuffer{}
 
 	var err error
 	cam, err = device.Open(devicePath, device.WithBufferSize(4))
 	if err != nil {
-		log.Printf("FATAL: Failed to open USB device: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to open USB device: %v", err))
 		os.Exit(ExitCodeUSBError)
 	}
 	defer cam.Close()
-	log.Println("Device opened with 4 buffers")
+	logJSON("info", "Device opened with 4 buffers")
 
 	// Auto-detect best MJPEG resolution if width/height not specified
 	captureWidth := *widthCapture
 	captureHeight := *heightCapture
 
 	if captureWidth == 0 || captureHeight == 0 {
-		log.Println("Auto-detecting best MJPEG resolution...")
+		logJSON("info", "Auto-detecting best MJPEG resolution")
 		captureWidth, captureHeight, err = getBestMJPEGResolution(cam)
 		if err != nil {
-			log.Printf("FATAL: Failed to detect MJPEG resolution: %v", err)
+			logJSON("error", fmt.Sprintf("Failed to detect MJPEG resolution: %v", err))
 			os.Exit(ExitCodeUSBError)
 		}
-		log.Printf("Auto-detected resolution: %dx%d", captureWidth, captureHeight)
+		logJSON("info", fmt.Sprintf("Auto-detected resolution: %dx%d", captureWidth, captureHeight))
 	} else {
-		log.Printf("Using specified resolution: %dx%d", captureWidth, captureHeight)
+		logJSON("info", fmt.Sprintf("Using specified resolution: %dx%d", captureWidth, captureHeight))
 	}
 
 	// Capture at specified resolution (MJPEG)
@@ -123,15 +122,16 @@ func main() {
 		PixelFormat: v4l2.PixelFmtMJPEG,
 		Field:       v4l2.FieldNone,
 	}); err != nil {
-		log.Printf("FATAL: Failed to set pixel format: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to set pixel format: %v", err))
 		os.Exit(ExitCodeUSBError)
 	}
 
 	pixFmt, err := cam.GetPixFormat()
 	if err != nil {
-		log.Fatalf("Failed to get pixel format: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to get pixel format: %v", err))
+		os.Exit(ExitCodeGenericError)
 	}
-	log.Printf("Capture format: %dx%d %s", pixFmt.Width, pixFmt.Height, pixFmt.PixelFormat)
+	logJSON("info", fmt.Sprintf("Capture format: %dx%d %s", pixFmt.Width, pixFmt.Height, pixFmt.PixelFormat))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -139,10 +139,10 @@ func main() {
 	cam.GetFrames()
 
 	if err := cam.Start(ctx); err != nil {
-		log.Printf("FATAL: Failed to start stream: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to start stream: %v", err))
 		os.Exit(ExitCodeUSBError)
 	}
-	log.Println("Stream started successfully")
+	logJSON("info", "Stream started successfully")
 
 	go captureFrames(ctx, cam, frameBuffer)
 	go startHTTPServer(frameBuffer)
@@ -151,7 +151,7 @@ func main() {
 }
 
 func captureFrames(ctx context.Context, cam *device.Device, frameBuffer *FrameBuffer) {
-	log.Println("Starting frame capture...")
+	logJSON("info", "Starting frame capture")
 	frameChan := cam.GetFrames()
 
 	for {
@@ -160,7 +160,7 @@ func captureFrames(ctx context.Context, cam *device.Device, frameBuffer *FrameBu
 			return
 		case frame, ok := <-frameChan:
 			if !ok {
-				log.Println("FATAL: Frame channel closed - USB device disconnected")
+				logJSON("error", "Frame channel closed - USB device disconnected")
 				os.Exit(ExitCodeUSBError)
 			}
 			if frame == nil {
@@ -170,7 +170,7 @@ func captureFrames(ctx context.Context, cam *device.Device, frameBuffer *FrameBu
 			// Resize full resolution MJPEG to SD using DCT scaling
 			resizedFrame, err := resizeMJPEGTurbo(frame.Data, widthSD, heightSD)
 			if err != nil {
-				log.Printf("Failed to resize frame: %v", err)
+				logJSON("warning", fmt.Sprintf("Failed to resize frame: %v", err))
 				frame.Release()
 				continue
 			}
@@ -206,7 +206,7 @@ func resizeMJPEGTurbo(jpegData []byte, targetWidth, targetHeight int) ([]byte, e
 
 func startHTTPServer(frameBuffer *FrameBuffer) {
 	http.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Client connected: %s", r.RemoteAddr)
+		logJSON("debug", fmt.Sprintf("Client connected: %s", r.RemoteAddr))
 
 		w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -231,7 +231,7 @@ func startHTTPServer(frameBuffer *FrameBuffer) {
 			fmt.Fprintf(w, "Content-Type: image/jpeg\r\n")
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(frame))
 			if _, err := w.Write(frame); err != nil {
-				log.Printf("Client disconnected: %s", r.RemoteAddr)
+				logJSON("debug", fmt.Sprintf("Client disconnected: %s", r.RemoteAddr))
 				return
 			}
 			fmt.Fprintf(w, "\r\n")
@@ -239,14 +239,15 @@ func startHTTPServer(frameBuffer *FrameBuffer) {
 		}
 	})
 
-	log.Println("HTTP server starting on :8080")
+	logJSON("info", "HTTP server starting on :8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("HTTP server failed: %v", err)
+		logJSON("error", fmt.Sprintf("HTTP server failed: %v", err))
+		os.Exit(ExitCodeGenericError)
 	}
 }
 
 func listenStdin(frameBuffer *FrameBuffer) {
-	log.Println("Listening for commands on stdin (type 'CAPTURE' to save full resolution frame, 'LIST' to list devices, 'INFO' for device info, 'CONTROLS' for JSON controls, 'SET_CONTROL <ID> <value>')...")
+	logJSON("info", "Listening for commands on stdin")
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for scanner.Scan() {
@@ -258,33 +259,30 @@ func listenStdin(frameBuffer *FrameBuffer) {
 		}
 
 		if parts[0] == "CAPTURE" {
-			log.Println("CAPTURE command received")
+			logJSON("debug", "CAPTURE command received")
 			saveFrame(frameBuffer)
-		} else if parts[0] == "LIST" {
-			log.Println("LIST command received")
-			listDevices()
 		} else if parts[0] == "INFO" {
-			log.Println("INFO command received")
+			logJSON("debug", "INFO command received")
 			showDeviceInfo()
 		} else if parts[0] == "CONTROLS" {
-			log.Println("CONTROLS command received")
+			logJSON("debug", "CONTROLS command received")
 			getControlsJSON()
 		} else if parts[0] == "SET_CONTROL" {
 			if len(parts) != 3 {
-				log.Printf("SET_CONTROL command received with invalid arguments: %s", command)
-				outputJSON(map[string]interface{}{
+				logJSON("warning", fmt.Sprintf("SET_CONTROL command received with invalid arguments: %s", command))
+				writeJSON("set_control_response", map[string]interface{}{
 					"status": "error",
 					"error":  "invalid command format, expected: SET_CONTROL <ID> <value>",
 				})
 			} else {
-				log.Printf("SET_CONTROL command received: ID=%s Value=%s", parts[1], parts[2])
+				logJSON("debug", fmt.Sprintf("SET_CONTROL command received: ID=%s Value=%s", parts[1], parts[2]))
 				setControl(parts[1], parts[2])
 			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Printf("Error reading stdin: %v", err)
+		logJSON("error", fmt.Sprintf("Error reading stdin: %v", err))
 	}
 }
 
@@ -292,13 +290,13 @@ func saveFrame(frameBuffer *FrameBuffer) {
 	// Get raw full resolution MJPEG from camera (no processing)
 	frame := frameBuffer.GetFull()
 	if frame == nil {
-		log.Println("No frame available to save")
+		logJSON("warning", "No frame available to save")
 		return
 	}
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		log.Printf("Failed to get home directory: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to get home directory: %v", err))
 		return
 	}
 
@@ -306,91 +304,58 @@ func saveFrame(frameBuffer *FrameBuffer) {
 
 	// Save raw full resolution MJPEG directly
 	if err := os.WriteFile(desktopPath, frame, 0644); err != nil {
-		log.Printf("Failed to save frame: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to save frame: %v", err))
 		return
 	}
 
-	log.Printf("Full resolution frame saved to: %s", desktopPath)
-}
-
-func listDevices() {
-	log.Println("Enumerating connected v4l2 devices...")
-
-	devices, err := device.GetAllDevicePaths()
-	if err != nil {
-		log.Printf("ERROR: Failed to enumerate devices: %v", err)
-		return
-	}
-
-	if len(devices) == 0 {
-		log.Println("No v4l2 devices found")
-		return
-	}
-
-	log.Printf("Found %d device(s):", len(devices))
-	for i, devPath := range devices {
-		// Try to open device and get capability info
-		tempDev, err := device.Open(devPath)
-		if err != nil {
-			log.Printf("  [%d] %s - (unable to open: %v)", i, devPath, err)
-			continue
-		}
-
-		cap := tempDev.Capability()
-		tempDev.Close()
-
-		log.Printf("  [%d] %s", i, devPath)
-		log.Printf("      Card: %s", cap.Card)
-		log.Printf("      Driver: %s", cap.Driver)
-		log.Printf("      Bus: %s", cap.BusInfo)
-	}
+	logJSON("info", fmt.Sprintf("Full resolution frame saved to: %s", desktopPath))
 }
 
 func showDeviceInfo() {
 	if cam == nil {
-		log.Println("ERROR: No device is currently open")
+		logJSON("error", "No device is currently open")
 		return
 	}
 
-	log.Println("=== Device Information ===")
+	logJSON("info", "=== Device Information ===")
 
 	// Get format descriptions
-	log.Println("\n--- Supported Formats ---")
+	logJSON("info", "--- Supported Formats ---")
 	formats, err := cam.GetFormatDescriptions()
 	if err != nil {
-		log.Printf("ERROR: Failed to get format descriptions: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to get format descriptions: %v", err))
 	} else {
-		log.Printf("Found %d format(s):", len(formats))
-		for i, fmt := range formats {
-			log.Printf("  [%d] %+v", i, fmt)
+		logJSON("info", fmt.Sprintf("Found %d format(s)", len(formats)))
+		for i, format := range formats {
+			logJSON("info", fmt.Sprintf("  [%d] %+v", i, format))
 		}
 	}
 
 	// Get all frame sizes for all formats
-	log.Println("\n--- Frame Sizes (Resolutions) ---")
+	logJSON("info", "--- Frame Sizes (Resolutions) ---")
 	frameSizes, err := v4l2.GetAllFormatFrameSizes(cam.Fd())
 	if err != nil {
-		log.Printf("ERROR: Failed to get frame sizes: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to get frame sizes: %v", err))
 	} else {
-		log.Printf("Found %d frame size configuration(s):", len(frameSizes))
+		logJSON("info", fmt.Sprintf("Found %d frame size configuration(s)", len(frameSizes)))
 		for i, fs := range frameSizes {
-			log.Printf("  [%d] %+v", i, fs)
+			logJSON("info", fmt.Sprintf("  [%d] %+v", i, fs))
 		}
 	}
 
 	// Get all controls
-	log.Println("\n--- Available Controls ---")
+	logJSON("info", "--- Available Controls ---")
 	controls, err := cam.QueryAllControls()
 	if err != nil {
-		log.Printf("ERROR: Failed to query controls: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to query controls: %v", err))
 	} else {
-		log.Printf("Found %d control(s):", len(controls))
+		logJSON("info", fmt.Sprintf("Found %d control(s)", len(controls)))
 		for i, ctrl := range controls {
-			log.Printf("  [%d] %+v", i, ctrl)
+			logJSON("info", fmt.Sprintf("  [%d] %+v", i, ctrl))
 		}
 	}
 
-	log.Println("\n=== End Device Information ===")
+	logJSON("info", "=== End Device Information ===")
 }
 
 func getBestMJPEGResolution(cam *device.Device) (int, int, error) {
@@ -431,40 +396,57 @@ func getBestMJPEGResolution(cam *device.Device) (int, int, error) {
 
 func getControlsJSON() {
 	if cam == nil {
-		log.Println("ERROR: No device is currently open")
+		logJSON("error", "No device is currently open")
 		return
 	}
 
 	controls, err := cam.QueryAllControls()
 	if err != nil {
-		log.Printf("ERROR: Failed to query controls: %v", err)
+		logJSON("error", fmt.Sprintf("Failed to query controls: %v", err))
 		return
 	}
 
-	// Convert controls to JSON
-	jsonData, err := json.Marshal(controls)
-	if err != nil {
-		log.Printf("ERROR: Failed to marshal controls to JSON: %v", err)
-		return
-	}
-
-	// Output JSON to stdout (not stderr like log does)
-	fmt.Println(string(jsonData))
+	// Output controls as JSON with type field
+	writeJSON("controls", map[string]interface{}{
+		"data": controls,
+	})
 }
 
-func outputJSON(data map[string]interface{}) {
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		log.Printf("ERROR: Failed to marshal JSON: %v", err)
-		return
+func writeJSON(msgType string, data map[string]interface{}) {
+	stdoutMutex.Lock()
+	defer stdoutMutex.Unlock()
+
+	msg := map[string]interface{}{"type": msgType}
+	for k, v := range data {
+		msg[k] = v
 	}
-	fmt.Println(string(jsonData))
+
+	if err := json.NewEncoder(os.Stdout).Encode(msg); err != nil {
+		// Fallback to stderr if JSON encoding fails
+		fmt.Fprintf(os.Stderr, "FATAL: Failed to encode JSON: %v\n", err)
+	}
+}
+
+func logJSON(level, message string, extraFields ...map[string]interface{}) {
+	data := map[string]interface{}{
+		"level":   level,
+		"message": message,
+	}
+
+	// Merge any extra fields
+	if len(extraFields) > 0 {
+		for k, v := range extraFields[0] {
+			data[k] = v
+		}
+	}
+
+	writeJSON("log", data)
 }
 
 func setControl(idStr string, valueStr string) {
 	if cam == nil {
-		log.Println("ERROR: No device is currently open")
-		outputJSON(map[string]interface{}{
+		logJSON("error", "No device is currently open")
+		writeJSON("set_control_response", map[string]interface{}{
 			"status": "error",
 			"error":  "no device is currently open",
 		})
@@ -474,8 +456,8 @@ func setControl(idStr string, valueStr string) {
 	// Parse control ID
 	var controlID uint32
 	if _, err := fmt.Sscanf(idStr, "%d", &controlID); err != nil {
-		log.Printf("ERROR: Invalid control ID: %s", idStr)
-		outputJSON(map[string]interface{}{
+		logJSON("error", fmt.Sprintf("Invalid control ID: %s", idStr))
+		writeJSON("set_control_response", map[string]interface{}{
 			"status": "error",
 			"error":  fmt.Sprintf("invalid control ID: %s", idStr),
 		})
@@ -485,8 +467,8 @@ func setControl(idStr string, valueStr string) {
 	// Parse control value
 	var value int32
 	if _, err := fmt.Sscanf(valueStr, "%d", &value); err != nil {
-		log.Printf("ERROR: Invalid control value: %s", valueStr)
-		outputJSON(map[string]interface{}{
+		logJSON("error", fmt.Sprintf("Invalid control value: %s", valueStr))
+		writeJSON("set_control_response", map[string]interface{}{
 			"status": "error",
 			"error":  fmt.Sprintf("invalid control value: %s", valueStr),
 		})
@@ -495,8 +477,8 @@ func setControl(idStr string, valueStr string) {
 
 	// Set the control value
 	if err := cam.SetControlValue(controlID, v4l2.CtrlValue(value)); err != nil {
-		log.Printf("ERROR: Failed to set control %d to %d: %v", controlID, value, err)
-		outputJSON(map[string]interface{}{
+		logJSON("error", fmt.Sprintf("Failed to set control %d to %d: %v", controlID, value, err))
+		writeJSON("set_control_response", map[string]interface{}{
 			"status": "error",
 			"error":  fmt.Sprintf("failed to set control: %v", err),
 			"id":     controlID,
@@ -505,8 +487,8 @@ func setControl(idStr string, valueStr string) {
 		return
 	}
 
-	log.Printf("Successfully set control %d to %d", controlID, value)
-	outputJSON(map[string]interface{}{
+	logJSON("info", fmt.Sprintf("Successfully set control %d to %d", controlID, value))
+	writeJSON("set_control_response", map[string]interface{}{
 		"status": "success",
 		"id":     controlID,
 		"value":  value,
