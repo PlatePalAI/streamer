@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"image"
@@ -33,8 +34,8 @@ const (
 )
 
 var (
-	widthCapture  = flag.Int("width", 3840, "Capture width in pixels")
-	heightCapture = flag.Int("height", 2160, "Capture height in pixels")
+	widthCapture  = flag.Int("width", 0, "Capture width in pixels (0 = auto-detect best MJPEG resolution)")
+	heightCapture = flag.Int("height", 0, "Capture height in pixels (0 = auto-detect best MJPEG resolution)")
 )
 
 type FrameBuffer struct {
@@ -78,15 +79,20 @@ func (fb *FrameBuffer) GetFull() []byte {
 	return frame
 }
 
+var cam *device.Device
+
 func main() {
 	flag.Parse()
 
+	// Ensure all log output goes to stderr (data output goes to stdout)
+	log.SetOutput(os.Stderr)
+
 	log.Printf("Starting v4l2 MJPEG streamer with libjpeg-turbo DCT scaling...")
-	log.Printf("Capture resolution: %dx%d", *widthCapture, *heightCapture)
 
 	frameBuffer := &FrameBuffer{}
 
-	cam, err := device.Open(devicePath, device.WithBufferSize(4))
+	var err error
+	cam, err = device.Open(devicePath, device.WithBufferSize(4))
 	if err != nil {
 		log.Printf("FATAL: Failed to open USB device: %v", err)
 		os.Exit(ExitCodeUSBError)
@@ -94,10 +100,26 @@ func main() {
 	defer cam.Close()
 	log.Println("Device opened with 4 buffers")
 
+	// Auto-detect best MJPEG resolution if width/height not specified
+	captureWidth := *widthCapture
+	captureHeight := *heightCapture
+
+	if captureWidth == 0 || captureHeight == 0 {
+		log.Println("Auto-detecting best MJPEG resolution...")
+		captureWidth, captureHeight, err = getBestMJPEGResolution(cam)
+		if err != nil {
+			log.Printf("FATAL: Failed to detect MJPEG resolution: %v", err)
+			os.Exit(ExitCodeUSBError)
+		}
+		log.Printf("Auto-detected resolution: %dx%d", captureWidth, captureHeight)
+	} else {
+		log.Printf("Using specified resolution: %dx%d", captureWidth, captureHeight)
+	}
+
 	// Capture at specified resolution (MJPEG)
 	if err := cam.SetPixFormat(v4l2.PixFormat{
-		Width:       uint32(*widthCapture),
-		Height:      uint32(*heightCapture),
+		Width:       uint32(captureWidth),
+		Height:      uint32(captureHeight),
 		PixelFormat: v4l2.PixelFmtMJPEG,
 		Field:       v4l2.FieldNone,
 	}); err != nil {
@@ -224,15 +246,40 @@ func startHTTPServer(frameBuffer *FrameBuffer) {
 }
 
 func listenStdin(frameBuffer *FrameBuffer) {
-	log.Println("Listening for commands on stdin (type 'CAPTURE' to save full resolution frame)...")
+	log.Println("Listening for commands on stdin (type 'CAPTURE' to save full resolution frame, 'LIST' to list devices, 'INFO' for device info, 'CONTROLS' for JSON controls, 'SET_CONTROL <ID> <value>')...")
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for scanner.Scan() {
 		command := strings.TrimSpace(scanner.Text())
+		parts := strings.Fields(command)
 
-		if command == "CAPTURE" {
+		if len(parts) == 0 {
+			continue
+		}
+
+		if parts[0] == "CAPTURE" {
 			log.Println("CAPTURE command received")
 			saveFrame(frameBuffer)
+		} else if parts[0] == "LIST" {
+			log.Println("LIST command received")
+			listDevices()
+		} else if parts[0] == "INFO" {
+			log.Println("INFO command received")
+			showDeviceInfo()
+		} else if parts[0] == "CONTROLS" {
+			log.Println("CONTROLS command received")
+			getControlsJSON()
+		} else if parts[0] == "SET_CONTROL" {
+			if len(parts) != 3 {
+				log.Printf("SET_CONTROL command received with invalid arguments: %s", command)
+				outputJSON(map[string]interface{}{
+					"status": "error",
+					"error":  "invalid command format, expected: SET_CONTROL <ID> <value>",
+				})
+			} else {
+				log.Printf("SET_CONTROL command received: ID=%s Value=%s", parts[1], parts[2])
+				setControl(parts[1], parts[2])
+			}
 		}
 	}
 
@@ -264,4 +311,204 @@ func saveFrame(frameBuffer *FrameBuffer) {
 	}
 
 	log.Printf("Full resolution frame saved to: %s", desktopPath)
+}
+
+func listDevices() {
+	log.Println("Enumerating connected v4l2 devices...")
+
+	devices, err := device.GetAllDevicePaths()
+	if err != nil {
+		log.Printf("ERROR: Failed to enumerate devices: %v", err)
+		return
+	}
+
+	if len(devices) == 0 {
+		log.Println("No v4l2 devices found")
+		return
+	}
+
+	log.Printf("Found %d device(s):", len(devices))
+	for i, devPath := range devices {
+		// Try to open device and get capability info
+		tempDev, err := device.Open(devPath)
+		if err != nil {
+			log.Printf("  [%d] %s - (unable to open: %v)", i, devPath, err)
+			continue
+		}
+
+		cap := tempDev.Capability()
+		tempDev.Close()
+
+		log.Printf("  [%d] %s", i, devPath)
+		log.Printf("      Card: %s", cap.Card)
+		log.Printf("      Driver: %s", cap.Driver)
+		log.Printf("      Bus: %s", cap.BusInfo)
+	}
+}
+
+func showDeviceInfo() {
+	if cam == nil {
+		log.Println("ERROR: No device is currently open")
+		return
+	}
+
+	log.Println("=== Device Information ===")
+
+	// Get format descriptions
+	log.Println("\n--- Supported Formats ---")
+	formats, err := cam.GetFormatDescriptions()
+	if err != nil {
+		log.Printf("ERROR: Failed to get format descriptions: %v", err)
+	} else {
+		log.Printf("Found %d format(s):", len(formats))
+		for i, fmt := range formats {
+			log.Printf("  [%d] %+v", i, fmt)
+		}
+	}
+
+	// Get all frame sizes for all formats
+	log.Println("\n--- Frame Sizes (Resolutions) ---")
+	frameSizes, err := v4l2.GetAllFormatFrameSizes(cam.Fd())
+	if err != nil {
+		log.Printf("ERROR: Failed to get frame sizes: %v", err)
+	} else {
+		log.Printf("Found %d frame size configuration(s):", len(frameSizes))
+		for i, fs := range frameSizes {
+			log.Printf("  [%d] %+v", i, fs)
+		}
+	}
+
+	// Get all controls
+	log.Println("\n--- Available Controls ---")
+	controls, err := cam.QueryAllControls()
+	if err != nil {
+		log.Printf("ERROR: Failed to query controls: %v", err)
+	} else {
+		log.Printf("Found %d control(s):", len(controls))
+		for i, ctrl := range controls {
+			log.Printf("  [%d] %+v", i, ctrl)
+		}
+	}
+
+	log.Println("\n=== End Device Information ===")
+}
+
+func getBestMJPEGResolution(cam *device.Device) (int, int, error) {
+	// Get all frame sizes for MJPEG format
+	frameSizes, err := v4l2.GetFormatFrameSizes(cam.Fd(), v4l2.PixelFmtMJPEG)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get MJPEG frame sizes: %w", err)
+	}
+
+	if len(frameSizes) == 0 {
+		return 0, 0, fmt.Errorf("no MJPEG resolutions available on this device")
+	}
+
+	// Find the highest resolution (max width × height)
+	var bestWidth, bestHeight uint32
+	var maxPixels uint32
+
+	for _, fs := range frameSizes {
+		// Use MaxWidth and MaxHeight as they represent the actual resolution
+		// (for discrete sizes, Min == Max)
+		width := fs.Size.MaxWidth
+		height := fs.Size.MaxHeight
+		pixels := width * height
+
+		if pixels > maxPixels {
+			maxPixels = pixels
+			bestWidth = width
+			bestHeight = height
+		}
+	}
+
+	if bestWidth == 0 || bestHeight == 0 {
+		return 0, 0, fmt.Errorf("invalid resolution detected: %dx%d", bestWidth, bestHeight)
+	}
+
+	return int(bestWidth), int(bestHeight), nil
+}
+
+func getControlsJSON() {
+	if cam == nil {
+		log.Println("ERROR: No device is currently open")
+		return
+	}
+
+	controls, err := cam.QueryAllControls()
+	if err != nil {
+		log.Printf("ERROR: Failed to query controls: %v", err)
+		return
+	}
+
+	// Convert controls to JSON
+	jsonData, err := json.Marshal(controls)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal controls to JSON: %v", err)
+		return
+	}
+
+	// Output JSON to stdout (not stderr like log does)
+	fmt.Println(string(jsonData))
+}
+
+func outputJSON(data map[string]interface{}) {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal JSON: %v", err)
+		return
+	}
+	fmt.Println(string(jsonData))
+}
+
+func setControl(idStr string, valueStr string) {
+	if cam == nil {
+		log.Println("ERROR: No device is currently open")
+		outputJSON(map[string]interface{}{
+			"status": "error",
+			"error":  "no device is currently open",
+		})
+		return
+	}
+
+	// Parse control ID
+	var controlID uint32
+	if _, err := fmt.Sscanf(idStr, "%d", &controlID); err != nil {
+		log.Printf("ERROR: Invalid control ID: %s", idStr)
+		outputJSON(map[string]interface{}{
+			"status": "error",
+			"error":  fmt.Sprintf("invalid control ID: %s", idStr),
+		})
+		return
+	}
+
+	// Parse control value
+	var value int32
+	if _, err := fmt.Sscanf(valueStr, "%d", &value); err != nil {
+		log.Printf("ERROR: Invalid control value: %s", valueStr)
+		outputJSON(map[string]interface{}{
+			"status": "error",
+			"error":  fmt.Sprintf("invalid control value: %s", valueStr),
+		})
+		return
+	}
+
+	// Set the control value
+	if err := cam.SetControlValue(controlID, v4l2.CtrlValue(value)); err != nil {
+		log.Printf("ERROR: Failed to set control %d to %d: %v", controlID, value, err)
+		outputJSON(map[string]interface{}{
+			"status": "error",
+			"error":  fmt.Sprintf("failed to set control: %v", err),
+			"id":     controlID,
+			"value":  value,
+		})
+		return
+	}
+
+	log.Printf("Successfully set control %d to %d", controlID, value)
+	outputJSON(map[string]interface{}{
+		"status": "success",
+		"id":     controlID,
+		"value":  value,
+	})
 }
