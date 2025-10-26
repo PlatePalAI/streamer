@@ -400,15 +400,36 @@ func getControlsJSON() {
 		return
 	}
 
+	// First get all available controls (metadata)
 	controls, err := cam.QueryAllControls()
 	if err != nil {
 		logJSON("error", fmt.Sprintf("Failed to query controls: %v", err))
 		return
 	}
 
+	// Now query each control individually to get its current value
+	controlsWithValues := make([]v4l2.Control, 0, len(controls))
+	for _, ctrl := range controls {
+		// Get the current value for this control
+		currentCtrl, err := cam.GetControl(ctrl.ID)
+		if err != nil {
+			// Skip control class headers and other unreadable controls (permission denied)
+			// These are organizational groupings like "User Controls" or "Camera Controls"
+			if strings.Contains(err.Error(), "permission denied") {
+				logJSON("debug", fmt.Sprintf("Skipping control class header: %d (%s)", ctrl.ID, ctrl.Name))
+				continue
+			}
+			// For other errors, log warning and use original control info
+			logJSON("warning", fmt.Sprintf("Failed to get current value for control %d (%s): %v", ctrl.ID, ctrl.Name, err))
+			controlsWithValues = append(controlsWithValues, ctrl)
+		} else {
+			controlsWithValues = append(controlsWithValues, currentCtrl)
+		}
+	}
+
 	// Output controls as JSON with type field
 	writeJSON("controls", map[string]interface{}{
-		"data": controls,
+		"data": controlsWithValues,
 	})
 }
 
@@ -487,10 +508,24 @@ func setControl(idStr string, valueStr string) {
 		return
 	}
 
-	logJSON("info", fmt.Sprintf("Successfully set control %d to %d", controlID, value))
+	// Query the control to get the actual value that was set (hardware may clamp to valid range)
+	actualControl, err := cam.GetControl(controlID)
+	if err != nil {
+		logJSON("warning", fmt.Sprintf("Control %d was set but failed to read back value: %v", controlID, err))
+		// Still report success but with the requested value
+		writeJSON("set_control_response", map[string]interface{}{
+			"status": "success",
+			"id":     controlID,
+			"value":  value,
+		})
+		return
+	}
+
+	logJSON("info", fmt.Sprintf("Successfully set control %d to %d (actual: %d)", controlID, value, actualControl.Value))
 	writeJSON("set_control_response", map[string]interface{}{
-		"status": "success",
-		"id":     controlID,
-		"value":  value,
+		"status":  "success",
+		"id":      controlID,
+		"value":   actualControl.Value,
+		"control": actualControl,
 	})
 }
