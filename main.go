@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/pixiv/go-libjpeg/jpeg"
 	"github.com/vladimirvivien/go4vl/device"
@@ -79,8 +79,10 @@ func (fb *FrameBuffer) GetFull() []byte {
 }
 
 var (
-	cam         *device.Device
-	stdoutMutex sync.Mutex
+	cam                *device.Device
+	stdoutMutex        sync.Mutex
+	activeClients      int32          // Atomic counter for active HTTP clients
+	newFrameNotifyChan chan struct{}  // Channel to notify HTTP handlers of new frames
 )
 
 func main() {
@@ -89,6 +91,7 @@ func main() {
 	logJSON("info", "Starting v4l2 MJPEG streamer with libjpeg-turbo DCT scaling")
 
 	frameBuffer := &FrameBuffer{}
+	newFrameNotifyChan = make(chan struct{}, 1) // Buffered to avoid blocking capture thread
 
 	var err error
 	cam, err = device.Open(devicePath, device.WithBufferSize(4))
@@ -167,16 +170,31 @@ func captureFrames(ctx context.Context, cam *device.Device, frameBuffer *FrameBu
 				continue
 			}
 
-			// Resize full resolution MJPEG to SD using DCT scaling
-			resizedFrame, err := resizeMJPEGTurbo(frame.Data, widthSD, heightSD)
-			if err != nil {
-				logJSON("warning", fmt.Sprintf("Failed to resize frame: %v", err))
-				frame.Release()
-				continue
-			}
+			// Check if any clients are connected
+			clientCount := atomic.LoadInt32(&activeClients)
 
-			// Store raw full resolution MJPEG and resized SD MJPEG
-			frameBuffer.Update(frame.Data, resizedFrame)
+			if clientCount > 0 {
+				// Process frame only when clients are watching
+				// Resize full resolution MJPEG to SD using DCT scaling
+				resizedFrame, err := resizeMJPEGTurbo(frame.Data, widthSD, heightSD)
+				if err != nil {
+					logJSON("warning", fmt.Sprintf("Failed to resize frame: %v", err))
+					frame.Release()
+					continue
+				}
+
+				// Store raw full resolution MJPEG and resized SD MJPEG
+				frameBuffer.Update(frame.Data, resizedFrame)
+
+				// Notify HTTP handlers that a new frame is available
+				// Non-blocking send to avoid slowing down capture
+				select {
+				case newFrameNotifyChan <- struct{}{}:
+				default:
+					// Channel already has a notification pending, skip
+				}
+			}
+			// If no clients, just discard the frame (keeps camera buffer flowing)
 
 			frame.Release()
 		}
@@ -206,7 +224,15 @@ func resizeMJPEGTurbo(jpegData []byte, targetWidth, targetHeight int) ([]byte, e
 
 func startHTTPServer(frameBuffer *FrameBuffer) {
 	http.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
-		logJSON("debug", fmt.Sprintf("Client connected: %s", r.RemoteAddr))
+		// Increment active client counter
+		count := atomic.AddInt32(&activeClients, 1)
+		logJSON("debug", fmt.Sprintf("Client connected: %s (total clients: %d)", r.RemoteAddr, count))
+
+		// Ensure we decrement the counter when this handler exits
+		defer func() {
+			count := atomic.AddInt32(&activeClients, -1)
+			logJSON("debug", fmt.Sprintf("Client disconnected: %s (remaining clients: %d)", r.RemoteAddr, count))
+		}()
 
 		w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -218,10 +244,8 @@ func startHTTPServer(frameBuffer *FrameBuffer) {
 			return
 		}
 
-		ticker := time.NewTicker(66 * time.Millisecond) // ~30 fps
-		defer ticker.Stop()
-
-		for range ticker.C {
+		// Event-driven streaming: wait for notifications of new frames
+		for range newFrameNotifyChan {
 			frame := frameBuffer.GetSD() // Stream SD version
 			if frame == nil {
 				continue
@@ -231,7 +255,7 @@ func startHTTPServer(frameBuffer *FrameBuffer) {
 			fmt.Fprintf(w, "Content-Type: image/jpeg\r\n")
 			fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(frame))
 			if _, err := w.Write(frame); err != nil {
-				logJSON("debug", fmt.Sprintf("Client disconnected: %s", r.RemoteAddr))
+				// Client disconnected (write failed)
 				return
 			}
 			fmt.Fprintf(w, "\r\n")
