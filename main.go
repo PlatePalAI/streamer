@@ -197,7 +197,7 @@ func resizeMJPEGTurbo(jpegData []byte, targetWidth, targetHeight int) ([]byte, e
 
 	// Encode using stdlib
 	var buf bytes.Buffer
-	if err := stdjpeg.Encode(&buf, img, &stdjpeg.Options{Quality: 40}); err != nil {
+	if err := stdjpeg.Encode(&buf, img, &stdjpeg.Options{Quality: 80}); err != nil {
 		return nil, fmt.Errorf("encode error: %w", err)
 	}
 
