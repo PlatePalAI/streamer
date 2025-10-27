@@ -82,7 +82,7 @@ var (
 	cam                *device.Device
 	stdoutMutex        sync.Mutex
 	activeClients      int32          // Atomic counter for active HTTP clients
-	newFrameNotifyChan chan struct{}  // Channel to notify HTTP handlers of new frames
+	newFrameNotifyChan chan struct{}  // Buffered channel to broadcast new frame availability to all HTTP handlers
 )
 
 func main() {
