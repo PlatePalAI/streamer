@@ -81,8 +81,8 @@ func (fb *FrameBuffer) GetFull() []byte {
 var (
 	cam                *device.Device
 	stdoutMutex        sync.Mutex
-	activeClients      int32          // Atomic counter for active HTTP clients
-	newFrameNotifyChan chan struct{}  // Buffered channel to broadcast new frame availability to all HTTP handlers
+	activeClients      int32         // Atomic counter for active HTTP clients
+	newFrameNotifyChan chan struct{} // Buffered channel to broadcast new frame availability to all HTTP handlers
 )
 
 func main() {
@@ -283,8 +283,14 @@ func listenStdin(frameBuffer *FrameBuffer) {
 		}
 
 		if parts[0] == "CAPTURE" {
-			logJSON("debug", "CAPTURE command received")
-			saveFrame(frameBuffer)
+			var savePath string
+			if len(parts) > 1 {
+				savePath = parts[1]
+				logJSON("debug", fmt.Sprintf("CAPTURE command received with path: %s", savePath))
+			} else {
+				logJSON("debug", "CAPTURE command received")
+			}
+			saveFrame(frameBuffer, savePath)
 		} else if parts[0] == "INFO" {
 			logJSON("debug", "INFO command received")
 			showDeviceInfo()
@@ -310,29 +316,52 @@ func listenStdin(frameBuffer *FrameBuffer) {
 	}
 }
 
-func saveFrame(frameBuffer *FrameBuffer) {
+func saveFrame(frameBuffer *FrameBuffer, savePath string) {
 	// Get raw full resolution MJPEG from camera (no processing)
 	frame := frameBuffer.GetFull()
 	if frame == nil {
 		logJSON("warning", "No frame available to save")
+		writeJSON("capture", map[string]interface{}{
+			"status": "error",
+			"error":  "no frame available",
+		})
 		return
 	}
 
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		logJSON("error", fmt.Sprintf("Failed to get home directory: %v", err))
-		return
+	var outputPath string
+	if savePath == "" {
+		// Default behavior: save to Desktop
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			logJSON("error", fmt.Sprintf("Failed to get home directory: %v", err))
+			writeJSON("capture", map[string]interface{}{
+				"status": "error",
+				"error":  fmt.Sprintf("failed to get home directory: %v", err),
+			})
+			return
+		}
+		outputPath = filepath.Join(homeDir, "Desktop", "frame.jpeg")
+	} else {
+		// Use provided path
+		outputPath = filepath.Join(savePath, "frame.jpeg")
 	}
-
-	desktopPath := filepath.Join(homeDir, "Desktop", "frame.jpeg")
 
 	// Save raw full resolution MJPEG directly
-	if err := os.WriteFile(desktopPath, frame, 0644); err != nil {
+	if err := os.WriteFile(outputPath, frame, 0644); err != nil {
 		logJSON("error", fmt.Sprintf("Failed to save frame: %v", err))
+		writeJSON("capture", map[string]interface{}{
+			"status": "error",
+			"error":  fmt.Sprintf("failed to write file: %v", err),
+			"path":   outputPath,
+		})
 		return
 	}
 
-	logJSON("info", fmt.Sprintf("Full resolution frame saved to: %s", desktopPath))
+	logJSON("info", fmt.Sprintf("Full resolution frame saved to: %s", outputPath))
+	writeJSON("capture", map[string]interface{}{
+		"status": "success",
+		"path":   outputPath,
+	})
 }
 
 func showDeviceInfo() {
